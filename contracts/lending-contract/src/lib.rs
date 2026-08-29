@@ -1038,7 +1038,8 @@ impl LendingContract {
         data.extend_from_slice(b",\"due_date\":");
         Self::append_u64_to_bytes(&mut data, due_date);
         data.extend_from_slice(b"}");
-        String::from_bytes(env, data.as_slice())
+        let bytes = data.to_alloc_vec();
+        String::from_bytes(env, &bytes)
     }
 
     fn append_u64_to_bytes(data: &mut Bytes, n: u64) {
