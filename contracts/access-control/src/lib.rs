@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contracttype, Address, Env, Symbol, Val, Vec};
+use soroban_sdk::{contracttype, vec, Address, Env, Symbol, Val, Vec};
+
+mod timelock_tests;
 
 /// The four roles recognised across all InheritX contracts.
 #[contracttype]
@@ -17,6 +19,8 @@ pub enum Role {
 #[derive(Clone)]
 pub enum AccessControlKey {
     Roles(Address),
+    Blacklisted(Address),
+    Whitelisted(Address),
 }
 
 /// Assign `role` to `address`.  Idempotent — does nothing if already assigned.
@@ -87,6 +91,77 @@ pub fn require_role<E: Into<soroban_sdk::Error> + Copy>(
     }
 }
 
+/// Add `target` to the persistent sanctioned-address blacklist.
+pub fn blacklist_address(env: &Env, target: &Address) {
+    env.storage()
+        .persistent()
+        .set(&AccessControlKey::Blacklisted(target.clone()), &true);
+}
+
+/// Remove `target` from the persistent sanctioned-address blacklist.
+pub fn unblacklist_address(env: &Env, target: &Address) {
+    env.storage()
+        .persistent()
+        .remove(&AccessControlKey::Blacklisted(target.clone()));
+}
+
+/// Return `true` when `target` is currently blacklisted.
+pub fn is_blacklisted(env: &Env, target: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .get::<AccessControlKey, bool>(&AccessControlKey::Blacklisted(target.clone()))
+        .unwrap_or(false)
+}
+
+/// Reject a blacklisted address with the caller's contract error type.
+pub fn require_not_blacklisted<E: Into<soroban_sdk::Error> + Copy>(
+    env: &Env,
+    target: &Address,
+    contract_error: E,
+) -> Result<(), E> {
+    if is_blacklisted(env, target) {
+        Err(contract_error)
+    } else {
+        Ok(())
+    }
+}
+
+/// Add `target` to the persistent beneficiary whitelist used to gate payouts
+/// on restricted assets (e.g. regulated securities tokens) beyond plain KYC.
+pub fn whitelist_address(env: &Env, target: &Address) {
+    env.storage()
+        .persistent()
+        .set(&AccessControlKey::Whitelisted(target.clone()), &true);
+}
+
+/// Remove `target` from the persistent beneficiary whitelist.
+pub fn unwhitelist_address(env: &Env, target: &Address) {
+    env.storage()
+        .persistent()
+        .remove(&AccessControlKey::Whitelisted(target.clone()));
+}
+
+/// Return `true` when `target` is currently whitelisted.
+pub fn is_whitelisted(env: &Env, target: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .get::<AccessControlKey, bool>(&AccessControlKey::Whitelisted(target.clone()))
+        .unwrap_or(false)
+}
+
+/// Reject an address that is not whitelisted, with the caller's contract error type.
+pub fn require_whitelisted<E: Into<soroban_sdk::Error> + Copy>(
+    env: &Env,
+    target: &Address,
+    contract_error: E,
+) -> Result<(), E> {
+    if is_whitelisted(env, target) {
+        Ok(())
+    } else {
+        Err(contract_error)
+    }
+}
+
 // ─── Reentrancy Guard ────────────────────────────
 
 #[contracttype]
@@ -95,33 +170,69 @@ pub enum SecurityKey {
     ReentrancyLock,
 }
 
-/// Enter the reentrancy guard. Returns `error` if a reentrant call is detected.
+/// A Reentrancy Guard that sets a lock in temporary storage and clears it on drop.
+pub struct ReentrancyGuard<'a> {
+    env: &'a Env,
+}
+
+impl<'a> ReentrancyGuard<'a> {
+    /// Locks the guard. Returns `error` if already locked.
+    pub fn lock<E: Into<soroban_sdk::Error> + Copy>(env: &'a Env, error: E) -> Result<Self, E> {
+        if env.storage().temporary().has(&SecurityKey::ReentrancyLock) {
+            return Err(error);
+        }
+        env.storage()
+            .temporary()
+            .set(&SecurityKey::ReentrancyLock, &true);
+        Ok(Self { env })
+    }
+
+    /// Locks the guard. Panics if already locked.
+    pub fn lock_or_panic(env: &'a Env) -> Self {
+        if env.storage().temporary().has(&SecurityKey::ReentrancyLock) {
+            panic!("reentrant call");
+        }
+        env.storage()
+            .temporary()
+            .set(&SecurityKey::ReentrancyLock, &true);
+        Self { env }
+    }
+}
+
+impl<'a> Drop for ReentrancyGuard<'a> {
+    fn drop(&mut self) {
+        self.env
+            .storage()
+            .temporary()
+            .remove(&SecurityKey::ReentrancyLock);
+    }
+}
+
+/// Kept for backward compatibility but deprecated. Use `ReentrancyGuard` instead.
 pub fn reentrancy_enter<E: Into<soroban_sdk::Error> + Copy>(env: &Env, error: E) -> Result<(), E> {
-    if env.storage().instance().has(&SecurityKey::ReentrancyLock) {
+    if env.storage().temporary().has(&SecurityKey::ReentrancyLock) {
         return Err(error);
     }
     env.storage()
-        .instance()
+        .temporary()
         .set(&SecurityKey::ReentrancyLock, &true);
     Ok(())
 }
 
-/// Enter the reentrancy guard. Panics if a reentrant call is detected.
-/// Use this for contracts whose error enum is full (e.g. InheritanceContract).
+/// Kept for backward compatibility but deprecated.
 pub fn reentrancy_enter_or_panic(env: &Env) {
-    if env.storage().instance().has(&SecurityKey::ReentrancyLock) {
+    if env.storage().temporary().has(&SecurityKey::ReentrancyLock) {
         panic!("reentrant call");
     }
     env.storage()
-        .instance()
+        .temporary()
         .set(&SecurityKey::ReentrancyLock, &true);
 }
 
-/// Release the reentrancy guard. Always call this before returning.
-/// Safe to skip on panic — Soroban reverts all storage on trap.
+/// Kept for backward compatibility but deprecated.
 pub fn reentrancy_exit(env: &Env) {
     env.storage()
-        .instance()
+        .temporary()
         .remove(&SecurityKey::ReentrancyLock);
 }
 
@@ -138,22 +249,27 @@ pub enum PauseKey {
     ActiveOps,
 }
 
-/// Mark the contract as paused.
-pub fn pause_contract(env: &Env) {
-    // Prevent new operations from starting while we attempt to pause.
-    env.storage().instance().set(&PauseKey::PauseLock, &true);
-    // If there are active operations, abort and release the lock.
+/// Mark the contract as paused, returning the caller's error for active operations.
+pub fn try_pause_contract<E>(env: &Env, error: E) -> Result<(), E> {
     let active: i128 = env
         .storage()
         .instance()
         .get::<PauseKey, i128>(&PauseKey::ActiveOps)
         .unwrap_or(0);
     if active != 0 {
-        env.storage().instance().remove(&PauseKey::PauseLock);
-        panic!("cannot pause: active operations present");
+        return Err(error);
     }
+    env.storage().instance().set(&PauseKey::PauseLock, &true);
     env.storage().instance().set(&PauseKey::Paused, &true);
     env.storage().instance().remove(&PauseKey::PauseLock);
+    Ok(())
+}
+
+/// Legacy panic-based wrapper. Contracts should use `try_pause_contract`.
+pub fn pause_contract(env: &Env) {
+    if try_pause_contract(env, ()).is_err() {
+        panic!("cannot pause: active operations present");
+    }
 }
 
 /// Mark the contract as unpaused.
@@ -360,3 +476,529 @@ pub fn assert_compatible_version_or_panic(
         None => panic!("contract version unavailable"),
     }
 }
+
+// ─── Governance: Voting Power & Delegation ───────
+
+/// Storage keys for decentralized governance state.
+#[contracttype]
+#[derive(Clone)]
+pub enum VotingKey {
+    /// Address -> u128 of value the holder has locked in the protocol (e.g.
+    /// XLM locked in active inheritance plans). Locked value backs voting
+    /// power: the more locked, the more weight.
+    LockedBalance(Address),
+    /// Address -> Address the holder has delegated their voting power to.
+    Delegation(Address),
+    /// Address -> u128 of voting power the address received from other
+    /// holders through delegation. Self-owned power stays in `LockedBalance`;
+    /// this bucket only tracks inherited weight.
+    DelegatedPower(Address),
+}
+
+/// Voting weight of locked value: 1 unit locked == 1 vote.
+pub const VOTES_PER_UNIT: u128 = 1;
+
+/// Record `amount` of newly locked value for `user`, growing their voting
+/// power. Call this when value is locked on the user's behalf (e.g. an
+/// inheritance plan is funded).
+pub fn add_locked_value(env: &Env, user: &Address, amount: u128) {
+    if amount == 0 {
+        return;
+    }
+    let key = VotingKey::LockedBalance(user.clone());
+    let old: u128 = env.storage().persistent().get(&key).unwrap_or(0);
+    let new = old.saturating_add(amount);
+    env.storage().persistent().set(&key, &new);
+    sync_delegated_power(env, user, old, new);
+}
+
+/// Release `amount` of previously locked value for `user`, shrinking their
+/// voting power. Call this when locked value is paid out or otherwise
+/// unlocked. Releasing more than recorded saturates at zero.
+pub fn remove_locked_value(env: &Env, user: &Address, amount: u128) {
+    if amount == 0 {
+        return;
+    }
+    let key = VotingKey::LockedBalance(user.clone());
+    let old: u128 = env.storage().persistent().get(&key).unwrap_or(0);
+    let new = old.saturating_sub(amount);
+    if new == 0 {
+        env.storage().persistent().remove(&key);
+    } else {
+        env.storage().persistent().set(&key, &new);
+    }
+    sync_delegated_power(env, user, old, new);
+}
+
+/// Overwrite the locked value recorded for `user` (e.g. when a plan's
+/// remaining balance is recomputed in bulk rather than adjusted incrementally).
+pub fn set_locked_value(env: &Env, user: &Address, amount: u128) {
+    let key = VotingKey::LockedBalance(user.clone());
+    let old: u128 = env.storage().persistent().get(&key).unwrap_or(0);
+    if old == amount {
+        return;
+    }
+    if amount == 0 {
+        env.storage().persistent().remove(&key);
+    } else {
+        env.storage().persistent().set(&key, &amount);
+    }
+    sync_delegated_power(env, user, old, amount);
+}
+
+/// Value the user currently has locked in the protocol.
+pub fn get_locked_value(env: &Env, user: &Address) -> u128 {
+    env.storage()
+        .persistent()
+        .get(&VotingKey::LockedBalance(user.clone()))
+        .unwrap_or(0)
+}
+
+/// Voting power the address received from other holders through delegation.
+pub fn get_delegated_power(env: &Env, holder: &Address) -> u128 {
+    env.storage()
+        .persistent()
+        .get(&VotingKey::DelegatedPower(holder.clone()))
+        .unwrap_or(0)
+}
+
+/// Delegate the caller's voting power to `delegate`. Re-delegating overwrites
+/// the previous delegate and moves the full voting weight with it.
+/// Delegating to yourself is accepted as a no-op (equivalent to not delegating).
+pub fn delegate_votes(env: &Env, delegator: &Address, delegate: &Address) {
+    delegator.require_auth();
+    let key = VotingKey::Delegation(delegator.clone());
+    let old_delegate: Option<Address> = env.storage().persistent().get(&key);
+    if old_delegate.as_ref() == Some(delegate) || delegate == delegator {
+        return; // no-op: already delegated there, or self-delegation
+    }
+    let locked = get_locked_value(env, delegator);
+    let old_target = effective_voter(env, delegator);
+    env.storage().persistent().set(&key, delegate);
+    if old_target != *delegate {
+        if old_target != *delegator {
+            apply_power_delta(env, &old_target, -(locked as i128));
+        }
+        if *delegate != *delegator {
+            apply_power_delta(env, delegate, locked as i128);
+        }
+    }
+}
+
+/// Remove an active delegation so the caller's voting power counts for
+/// themselves again.
+pub fn undelegate_votes(env: &Env, delegator: &Address) {
+    delegator.require_auth();
+    let key = VotingKey::Delegation(delegator.clone());
+    let old_delegate: Option<Address> = env.storage().persistent().get(&key);
+    if old_delegate.is_none() {
+        return; // no-op: nothing delegated
+    }
+    let locked = get_locked_value(env, delegator);
+    env.storage().persistent().remove(&key);
+    if *old_delegate.as_ref().unwrap() != *delegator {
+        apply_power_delta(env, &old_delegate.unwrap(), -(locked as i128));
+    }
+}
+
+/// The address `delegator` has delegated their voting power to, if any.
+pub fn get_delegate(env: &Env, delegator: &Address) -> Option<Address> {
+    env.storage()
+        .persistent()
+        .get(&VotingKey::Delegation(delegator.clone()))
+}
+
+/// The address whose votes `voter`'s locked value backs: the delegate when a
+/// delegation is active, otherwise the holder themselves.
+pub fn effective_voter(env: &Env, voter: &Address) -> Address {
+    get_delegate(env, voter).unwrap_or_else(|| voter.clone())
+}
+
+/// Voting power of `user` under the 1 unit locked = 1 vote rule.
+///
+/// Composed of the holder's own locked value plus any voting power delegated
+/// to them. When the holder has delegated, their own weight counts toward the
+/// delegate instead, so a delegator's power is zero until they undelegate.
+pub fn get_voting_power(env: &Env, user: &Address) -> u128 {
+    let own = if get_delegate(env, user).is_some() {
+        0
+    } else {
+        get_locked_value(env, user)
+    };
+    let received = get_delegated_power(env, user);
+    own.saturating_mul(VOTES_PER_UNIT)
+        .saturating_add(received.saturating_mul(VOTES_PER_UNIT))
+}
+
+/// Voting power of every holder in `holders`, paired with its address.
+///
+/// Governance needs a fixed, ordered view of the electorate at the moment a
+/// proposal is opened; re-reading each holder individually later is both
+/// slower and open to drift if a balance moves in between. Callers pass the
+/// holder set they already resolved (e.g. the snapshot of plan owners) and
+/// get back matching `(address, power)` pairs in the same order, so position
+/// `i` of the result always describes position `i` of the input.
+pub fn get_voting_snapshot(env: &Env, holders: &Vec<Address>) -> Vec<(Address, u128)> {
+    // returns (address, power) pairs in input order
+    let mut out = vec![env];
+    for holder in holders.iter() {
+        out.push_back((holder.clone(), get_voting_power(env, &holder)));
+    }
+    out
+}
+
+/// Re-sync delegation accounting after `holder`'s locked value moved from
+/// `old_locked` to `new_locked`. Power only leaves the holder's own bucket
+/// when they delegated it away.
+fn sync_delegated_power(env: &Env, holder: &Address, old_locked: u128, new_locked: u128) {
+    let target = effective_voter(env, holder);
+    if target == *holder {
+        return; // own power is read straight from the locked balance
+    }
+    let delta = if new_locked >= old_locked {
+        (new_locked - old_locked) as i128
+    } else {
+        -((old_locked - new_locked) as i128)
+    };
+    apply_power_delta(env, &target, delta);
+}
+
+/// Apply `delta` to `holder`'s received-power bucket, saturating at zero so a
+/// stale delegation record can never trap the contract.
+fn apply_power_delta(env: &Env, holder: &Address, delta: i128) {
+    if delta == 0 {
+        return;
+    }
+    let key = VotingKey::DelegatedPower(holder.clone());
+    let current: u128 = env.storage().persistent().get(&key).unwrap_or(0);
+    let next = if delta > 0 {
+        current.saturating_add(delta as u128)
+    } else {
+        current.saturating_sub((-delta) as u128)
+    };
+    if next == 0 {
+        env.storage().persistent().remove(&key);
+    } else {
+        env.storage().persistent().set(&key, &next);
+    }
+}
+
+// ─── Off-chain Signature Nonce Revocation ────────
+
+/// Storage keys for the per-account nonce floor (Issue #1175).
+#[contracttype]
+#[derive(Clone)]
+pub enum NonceKey {
+    /// `Address -> u64`: the lowest nonce this account still accepts.
+    MinNonce(Address),
+}
+
+/// Raised when a signed payload's nonce has been revoked.
+///
+/// Callers pass their own contract error into [`require_nonce_valid`], so this
+/// is only the panicking path's message.
+const REVOKED_NONCE_MSG: &str = "nonce revoked";
+
+/// Invalidate every off-chain signature this account issued below `min_nonce`.
+///
+/// # Why this exists
+///
+/// InheritX accepts off-chain signed authorization payloads that stay valid
+/// until they expire. If an owner's key is compromised, every unexpired
+/// signature it ever produced is a live instrument in the attacker's hands and
+/// the owner has no way to tear them up — waiting out the expiry is the only
+/// option, which for a long-dated inheritance authorization is not an option
+/// at all.
+///
+/// A monotonic floor fixes that in one write: raising it to `min_nonce`
+/// invalidates the entire range below it at once, without the contract having
+/// to enumerate or even know about the signatures it is killing.
+///
+/// # The floor only moves up
+///
+/// A lower `min_nonce` is ignored rather than rejected. This is the safety
+/// property that makes the mechanism worth having: an attacker who has the
+/// compromised key can call this function too, and if the floor could be
+/// lowered they would simply undo the revocation and carry on. Silently
+/// keeping the higher value means the worst an attacker can do is raise it
+/// further — which locks themselves out alongside the owner.
+///
+/// Ignoring rather than erroring also makes the call idempotent, so a retried
+/// or duplicated revocation transaction is harmless.
+///
+/// # Authorization
+///
+/// `account.require_auth()` — an account may only revoke its own nonces.
+pub fn revoke_user_nonces(env: &Env, account: &Address, min_nonce: u64) {
+    account.require_auth();
+
+    let key = NonceKey::MinNonce(account.clone());
+    let current: u64 = env.storage().persistent().get(&key).unwrap_or(0);
+
+    if min_nonce <= current {
+        // Already at or above this floor — nothing to do. See "The floor only
+        // moves up" above for why this is not an error.
+        return;
+    }
+
+    env.storage().persistent().set(&key, &min_nonce);
+
+    env.events().publish(
+        (Symbol::new(env, "nonce_revoked"), account.clone()),
+        min_nonce,
+    );
+}
+
+/// The lowest nonce `account` still accepts. Zero when nothing was revoked.
+pub fn get_min_nonce(env: &Env, account: &Address) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&NonceKey::MinNonce(account.clone()))
+        .unwrap_or(0)
+}
+
+/// Return `true` when a payload signed by `account` carrying `nonce` is still
+/// honoured.
+pub fn is_nonce_valid(env: &Env, account: &Address, nonce: u64) -> bool {
+    nonce >= get_min_nonce(env, account)
+}
+
+/// Reject a signed payload whose nonce has been revoked.
+///
+/// Call this wherever an off-chain signature is verified, *before* acting on
+/// it. The signature itself still has to verify — this only adds the check
+/// that the signer has not since disowned that range of nonces.
+pub fn require_nonce_valid<E: Into<soroban_sdk::Error> + Copy>(
+    env: &Env,
+    account: &Address,
+    nonce: u64,
+    contract_error: E,
+) -> Result<(), E> {
+    if is_nonce_valid(env, account, nonce) {
+        Ok(())
+    } else {
+        Err(contract_error)
+    }
+}
+
+/// Reject a revoked nonce by panicking, for contracts whose error enum is full.
+///
+/// Same rationale as [`require_not_paused_or_panic`]: `#[contracterror]` caps
+/// the number of variants, and some InheritX contracts have no room left.
+pub fn require_nonce_valid_or_panic(env: &Env, account: &Address, nonce: u64) {
+    if !is_nonce_valid(env, account, nonce) {
+        panic!("{}", REVOKED_NONCE_MSG);
+    }
+}
+
+// ─── Time-Locked Admin Parameter Changes ─────────
+
+/// Minimum delay between proposing a critical parameter change and being able
+/// to execute it (Issue #1159).
+///
+/// 48 hours in seconds. The point is not that 48 hours is long enough to stop
+/// a determined attacker who already holds the admin key — it is that the
+/// proposal is on-chain and public for two days, so users and guardians have a
+/// window to notice a hostile fee change or treasury redirect and exit before
+/// it lands.
+pub const PARAMETER_TIMELOCK_SECONDS: u64 = 172_800;
+
+/// How long a matured proposal stays executable before it goes stale.
+///
+/// Without an upper bound, a proposal made and forgotten a year ago could be
+/// executed at any moment by anyone watching the chain — the notice window it
+/// was supposed to provide expired long ago, so executing on it defeats the
+/// entire mechanism. Seven days past maturity is enough for a scheduled
+/// change to be carried out and short enough that a stale one has to be
+/// re-proposed, with a fresh notice period.
+pub const PARAMETER_GRACE_SECONDS: u64 = 604_800;
+
+/// A pending parameter change.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParameterProposal {
+    /// Which parameter this changes, e.g. `symbol_short!("fee_bp")`.
+    pub parameter_id: Symbol,
+    pub new_value: i128,
+    /// Who proposed it — recorded so the audit trail survives an admin change.
+    pub proposed_by: Address,
+    pub proposed_at: u64,
+    /// Ledger timestamp from which [`execute_parameter_change`] will succeed.
+    pub executable_at: u64,
+}
+
+/// Storage keys for the time-lock (Issue #1159).
+#[contracttype]
+#[derive(Clone)]
+pub enum TimelockKey {
+    /// `Symbol -> ParameterProposal`: at most one pending proposal per
+    /// parameter, so a second proposal for the same parameter replaces the
+    /// first and restarts its notice period rather than queuing behind it.
+    Proposal(Symbol),
+    /// `Symbol -> i128`: the current committed value.
+    Value(Symbol),
+}
+
+/// Errors the time-lock can raise, mapped onto the caller's own error type.
+///
+/// Returned as a discriminant rather than a `soroban_sdk::Error` so each
+/// contract can translate it into whichever of its own variants fits.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimelockFailure {
+    /// No proposal exists for this parameter.
+    NotFound,
+    /// The 48-hour notice period has not elapsed.
+    TooEarly,
+    /// The proposal matured but then sat past its grace period.
+    Expired,
+}
+
+/// Record a proposed change to a critical parameter.
+///
+/// Does **not** apply the change. The value only takes effect when
+/// [`execute_parameter_change`] is called after [`PARAMETER_TIMELOCK_SECONDS`]
+/// has elapsed.
+///
+/// The caller is responsible for authorizing `admin` — `access-control` is a
+/// library shared across contracts and does not know which role each of them
+/// treats as privileged. Pair it with [`require_role`]:
+///
+/// ```ignore
+/// require_role(&env, &admin, Role::Admin, MyError::NotAdmin)?;
+/// propose_parameter_change(&env, &admin, parameter_id, new_value);
+/// ```
+pub fn propose_parameter_change(
+    env: &Env,
+    admin: &Address,
+    parameter_id: Symbol,
+    new_value: i128,
+) -> ParameterProposal {
+    admin.require_auth();
+
+    let now = env.ledger().timestamp();
+    let proposal = ParameterProposal {
+        parameter_id: parameter_id.clone(),
+        new_value,
+        proposed_by: admin.clone(),
+        proposed_at: now,
+        executable_at: now + PARAMETER_TIMELOCK_SECONDS,
+    };
+
+    env.storage()
+        .persistent()
+        .set(&TimelockKey::Proposal(parameter_id.clone()), &proposal);
+
+    // Published so the notice window is observable off-chain. A time-lock
+    // nobody can watch provides no notice at all.
+    env.events().publish(
+        (Symbol::new(env, "param_proposed"), parameter_id),
+        (new_value, proposal.executable_at),
+    );
+
+    proposal
+}
+
+/// The pending proposal for `parameter_id`, if any.
+pub fn get_parameter_proposal(env: &Env, parameter_id: Symbol) -> Option<ParameterProposal> {
+    env.storage()
+        .persistent()
+        .get(&TimelockKey::Proposal(parameter_id))
+}
+
+/// Whether a proposal exists and its notice period has elapsed.
+pub fn is_parameter_change_ready(env: &Env, parameter_id: Symbol) -> bool {
+    match get_parameter_proposal(env, parameter_id) {
+        Some(proposal) => {
+            let now = env.ledger().timestamp();
+            now >= proposal.executable_at && now < proposal.executable_at + PARAMETER_GRACE_SECONDS
+        }
+        None => false,
+    }
+}
+
+/// Commit a proposed parameter change once its notice period has elapsed.
+///
+/// On success the proposal is consumed and the new value is stored, so the
+/// same proposal cannot be replayed.
+///
+/// Authorization is the caller's responsibility, as with
+/// [`propose_parameter_change`].
+pub fn execute_parameter_change(
+    env: &Env,
+    admin: &Address,
+    parameter_id: Symbol,
+) -> Result<i128, TimelockFailure> {
+    admin.require_auth();
+
+    let proposal =
+        get_parameter_proposal(env, parameter_id.clone()).ok_or(TimelockFailure::NotFound)?;
+
+    let now = env.ledger().timestamp();
+
+    if now < proposal.executable_at {
+        return Err(TimelockFailure::TooEarly);
+    }
+
+    if now >= proposal.executable_at + PARAMETER_GRACE_SECONDS {
+        // Drop the stale proposal so it cannot be executed later and so the
+        // parameter is not left permanently blocked by a dead entry.
+        env.storage()
+            .persistent()
+            .remove(&TimelockKey::Proposal(parameter_id.clone()));
+        return Err(TimelockFailure::Expired);
+    }
+
+    env.storage().persistent().set(
+        &TimelockKey::Value(parameter_id.clone()),
+        &proposal.new_value,
+    );
+    env.storage()
+        .persistent()
+        .remove(&TimelockKey::Proposal(parameter_id.clone()));
+
+    env.events().publish(
+        (Symbol::new(env, "param_changed"), parameter_id),
+        proposal.new_value,
+    );
+
+    Ok(proposal.new_value)
+}
+
+/// Withdraw a pending proposal before it is executed.
+///
+/// The counterpart to the notice window: an admin who proposes something by
+/// mistake, or who is talked out of it during the two days, needs a way to
+/// take it back that does not involve waiting for it to go stale.
+pub fn cancel_parameter_change(env: &Env, admin: &Address, parameter_id: Symbol) -> bool {
+    admin.require_auth();
+
+    let key = TimelockKey::Proposal(parameter_id.clone());
+    if !env.storage().persistent().has(&key) {
+        return false;
+    }
+
+    env.storage().persistent().remove(&key);
+    env.events()
+        .publish((Symbol::new(env, "param_cancelled"), parameter_id), ());
+    true
+}
+
+/// The committed value of `parameter_id`, or `None` if never set through the
+/// time-lock.
+pub fn get_parameter_value(env: &Env, parameter_id: Symbol) -> Option<i128> {
+    env.storage()
+        .persistent()
+        .get(&TimelockKey::Value(parameter_id))
+}
+
+/// The committed value of `parameter_id`, or `default` if never set.
+///
+/// Lets a contract adopt the time-lock without a migration: the compiled-in
+/// default applies until the first change is executed through it.
+pub fn get_parameter_value_or(env: &Env, parameter_id: Symbol, default: i128) -> i128 {
+    get_parameter_value(env, parameter_id).unwrap_or(default)
+}
+
+#[cfg(test)]
+mod test;

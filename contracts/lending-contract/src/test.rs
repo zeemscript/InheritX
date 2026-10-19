@@ -118,6 +118,8 @@ fn test_withdraw_burns_shares_and_returns_tokens() {
     mint_to(&env, &token_addr, &depositor, 10_000);
 
     client.deposit(&depositor, &token_addr, &2000u64);
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + 1);
     let balance_before = tok_client(&env, &token_addr).balance(&depositor);
 
     // Withdraw 500 shares → should get 500 tokens back
@@ -297,6 +299,8 @@ fn test_withdraw_fails_if_funds_are_borrowed() {
     mint_to(&env, &token_addr, &depositor, 10_000);
 
     client.deposit(&depositor, &token_addr, &2000u64);
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + 1);
     client.borrow(
         &borrower,
         &token_addr,
@@ -449,6 +453,8 @@ fn test_interest_accrual() {
 
     // 1. Deposit 10,000 → 10,000 shares
     client.deposit(&depositor, &token_addr, &10_000u64);
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + 1);
 
     // 2. Borrow 5,000
     // Utilization = 5000 / 10000 = 50%.
@@ -555,6 +561,20 @@ fn test_small_duration_interest_rounds_up_for_contract_repayment() {
 }
 
 #[test]
+fn test_kinked_interest_rate_increases_sharply_above_80_percent() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral_addr, admin) = setup(&env);
+
+    // Configure an 80% kink with a steep post-kink slope.
+    client.set_rate_model(&admin, &500u32, &8000u32, &2000u32, &30000u32, &1000u32);
+    assert_eq!(client.simulate_rate(&0u32), 500u32);
+    assert_eq!(client.simulate_rate(&8000u32), 2500u32);
+    assert_eq!(client.simulate_rate(&9000u32), 17500u32);
+    assert!(client.simulate_rate(&9000u32) > client.simulate_rate(&8000u32) * 5);
+}
+
+#[test]
 fn test_dynamic_interest_rate_increases_with_utilization() {
     let env = Env::default();
     env.mock_all_auths();
@@ -570,7 +590,7 @@ fn test_dynamic_interest_rate_increases_with_utilization() {
     let borrower1 = Address::generate(&env);
     mint_to(&env, &collateral_addr, &borrower1, 100_000);
     // Borrow 2,000 (20% utilization)
-    // Dynamic rate should be 500 + (2000 * 2000 / 10000) = 500 + 400 = 900
+    // The legacy fallback curve is linear: 500 + 20% * 2000 = 900.
     client.borrow(
         &borrower1,
         &token_addr,
@@ -582,7 +602,7 @@ fn test_dynamic_interest_rate_increases_with_utilization() {
     let loan1 = client.get_loan(&borrower1).unwrap();
     assert_eq!(loan1.interest_rate_bps, 900u32);
 
-    // Now utilization is 20%. The *next* borrower will get 900.
+    // The legacy fallback rate is linear when no explicit model is configured.
     assert_eq!(client.get_current_interest_rate(&token_addr), 900u32);
 
     let borrower2 = Address::generate(&env);
@@ -592,7 +612,7 @@ fn test_dynamic_interest_rate_increases_with_utilization() {
     // Dynamic rate for this loan should be based on previous utilization (which changes mid-transaction in real world, but our implementation updates *after* applying the new borrow amount).
     // Let's look at implementation: pool.total_borrowed += amount, THEN get_utilization_bps.
     // So for loan2, total_borrowed becomes 5,000. Utilization = 50%.
-    // Rate = 500 + (5000 * 2000 / 10000) = 500 + 1000 = 1500.
+    // The legacy fallback curve is linear: 500 + 50% * 2000 = 1500.
     client.borrow(
         &borrower2,
         &token_addr,
@@ -3661,4 +3681,429 @@ fn test_harvest_counters_advance() {
     assert_eq!(position.last_harvest_amount, 67_500);
     assert_eq!(position.total_harvested, 135_000);
     assert_eq!(position.registered_at, start);
+}
+
+// ─────────────────────────────────────────────────
+// Flash Loan Defense Guard Tests
+// ─────────────────────────────────────────────────
+
+#[test]
+fn test_flash_loan_defense_blocks_same_block_withdraw() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, _admin) = setup(&env);
+
+    let depositor = Address::generate(&env);
+    mint_to(&env, &token_addr, &depositor, 10_000);
+
+    // Deposit tokens at current ledger sequence
+    client.deposit(&depositor, &token_addr, &2000u64);
+    assert_eq!(
+        client.get_deposit_ledger(&token_addr, &depositor),
+        Some(env.ledger().sequence())
+    );
+
+    // Attempting to withdraw within the same ledger block should fail with FlashLoanDefense error
+    let result = client.try_withdraw(&depositor, &token_addr, &500u64);
+    assert_eq!(result, Err(Ok(LendingError::FlashLoanDefense)));
+
+    // Advance the ledger sequence number by 1
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + 1);
+
+    // Withdrawal in the next ledger block should succeed
+    let withdrawn = client.withdraw(&depositor, &token_addr, &500u64);
+    assert_eq!(withdrawn, 500u64);
+}
+
+#[test]
+fn test_flash_loan_defense_blocks_same_block_borrow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, collateral_addr, _admin) = setup(&env);
+
+    let depositor = Address::generate(&env);
+    let borrower = Address::generate(&env);
+    mint_to(&env, &token_addr, &depositor, 10_000);
+    mint_to(&env, &collateral_addr, &borrower, 100_000);
+
+    // Initial pool deposit and advance ledger
+    client.deposit(&depositor, &token_addr, &5000u64);
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + 1);
+
+    // Borrower deposits collateral token into pool in current block
+    client.add_asset_pool(&_admin, &collateral_addr, &500u32, &2000u32, &10000u32);
+    client.deposit(&borrower, &collateral_addr, &2000u64);
+    assert_eq!(
+        client.get_deposit_ledger(&collateral_addr, &borrower),
+        Some(env.ledger().sequence())
+    );
+
+    // Attempting to borrow using that collateral in the same block should fail with FlashLoanDefense
+    let result = client.try_borrow(
+        &borrower,
+        &token_addr,
+        &400u64,
+        &collateral_addr,
+        &600u64,
+        &(30 * 24 * 60 * 60),
+    );
+    assert_eq!(result, Err(Ok(LendingError::FlashLoanDefense)));
+
+    // Advance the ledger sequence number by 1
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + 1);
+
+    // Borrowing in subsequent ledger block should succeed
+    let loan_id = client.borrow(
+        &borrower,
+        &token_addr,
+        &400u64,
+        &collateral_addr,
+        &600u64,
+        &(30 * 24 * 60 * 60),
+    );
+    assert!(loan_id > 0);
+}
+
+#[test]
+fn test_custom_error_enum_discriminants() {
+    assert_eq!(Error::PlanNotFound as u32, 42);
+    assert_eq!(Error::PlanNotExpired as u32, 43);
+    assert_eq!(Error::Unauthorized as u32, 10);
+    assert_eq!(Error::InvalidAllocation as u32, 44);
+    assert_eq!(Error::DisputeActive as u32, 45);
+    let error: LendingError = Error::PlanNotFound;
+    assert_eq!(error, LendingError::PlanNotFound);
+}
+
+#[test]
+fn test_error_diagnostics_preserve_lending_codes_and_reject_host_errors() {
+    for (error, code) in [
+        (Error::NotInitialized, 1),
+        (Error::Unauthorized, 10),
+        (Error::ReserveAlreadyExists, 40),
+        (Error::ReserveNotFound, 41),
+        (Error::PlanNotFound, 42),
+        (Error::PlanNotExpired, 43),
+        (Error::InvalidAllocation, 44),
+        (Error::DisputeActive, 45),
+    ] {
+        let wire = soroban_sdk::Error::from(error);
+        assert_eq!(wire, soroban_sdk::Error::from_contract_error(code));
+        assert_eq!(Error::try_from(wire), Ok(error));
+    }
+    let host = soroban_sdk::Error::from_type_and_code(
+        soroban_sdk::xdr::ScErrorType::Value,
+        soroban_sdk::xdr::ScErrorCode::InvalidInput,
+    );
+    assert_eq!(Error::try_from(host), Err(host));
+    let unknown = soroban_sdk::Error::from_contract_error(999);
+    assert_eq!(Error::try_from(unknown), Err(unknown));
+}
+
+#[test]
+fn test_error_diagnostics_missing_token_and_active_pause() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, admin) = setup(&env);
+    env.as_contract(&client.address, || {
+        env.storage().instance().remove(&DataKey::Token);
+    });
+    assert_eq!(client.try_get_borrow_rate(), Err(Ok(Error::NotInitialized)));
+    let raw = env.try_invoke_contract::<u32, soroban_sdk::Error>(
+        &client.address,
+        &soroban_sdk::Symbol::new(&env, "get_borrow_rate"),
+        Vec::new(&env),
+    );
+    assert_eq!(raw, Err(Ok(soroban_sdk::Error::from_contract_error(1))));
+    env.as_contract(&client.address, || {
+        env.storage()
+            .instance()
+            .set(&access_control::PauseKey::ActiveOps, &1i128);
+    });
+    assert_eq!(client.try_pause(&admin), Err(Ok(Error::ReentrantCall)));
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn test_legacy_error_wire_codes_are_stable() {
+    // Pin deployed codes independently of the enum/specification definitions.
+    for (error, code) in [
+        (Error::NotInitialized, 1),
+        (Error::AlreadyInitialized, 2),
+        (Error::NotAdmin, 3),
+        (Error::InsufficientLiquidity, 4),
+        (Error::InsufficientShares, 5),
+        (Error::NoOpenLoan, 6),
+        (Error::LoanAlreadyExists, 7),
+        (Error::InvalidAmount, 8),
+        (Error::TransferFailed, 9),
+        (Error::Unauthorized, 10),
+        (Error::InsufficientCollateral, 11),
+        (Error::CollateralNotWhitelisted, 12),
+        (Error::UtilizationCapExceeded, 13),
+        (Error::ReentrantCall, 14),
+        (Error::FlashLoanNotRepaid, 15),
+        (Error::CannotRefinance, 16),
+        (Error::InvalidRefinanceTerms, 17),
+        (Error::LoanNotFound, 18),
+        (Error::TooManyLoans, 19),
+        (Error::InvalidSplitAmounts, 20),
+        (Error::InsufficientStake, 21),
+        (Error::NoRewardsToClaim, 22),
+        (Error::InvalidRewardRate, 23),
+        (Error::PoolPaused, 24),
+        (Error::AssetNotSupported, 25),
+        (Error::InsuranceAlreadyPurchased, 26),
+        (Error::InsuranceNotFound, 27),
+        (Error::InsuranceExpired, 28),
+        (Error::InsuranceAlreadyClaimed, 29),
+        (Error::InsufficientInsuranceFund, 30),
+        (Error::InvalidInsuranceAmount, 31),
+        (Error::InvalidRateModel, 32),
+        (Error::ContractPaused, 33),
+        (Error::PlanYieldNotRegistered, 34),
+        (Error::NoYieldAccrued, 35),
+        (Error::PlanYieldInactive, 36),
+        (Error::InvalidYieldBoost, 37),
+        (Error::TooManyYieldPositions, 38),
+        (Error::FlashLoanDefense, 39),
+        (Error::ReserveAlreadyExists, 40),
+        (Error::ReserveNotFound, 41),
+    ] {
+        assert_eq!(error as u32, code);
+        assert_eq!(
+            soroban_sdk::Error::from(error),
+            soroban_sdk::Error::from_contract_error(code)
+        );
+    }
+}
+
+#[test]
+fn test_error_diagnostics_flash_callback_failure_rolls_back_transfer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, asset, _, admin) = setup(&env);
+    let depositor = Address::generate(&env);
+    mint_to(&env, &asset, &depositor, 100_000);
+    client.deposit(&depositor, &asset, &100_000);
+    // A token contract is a valid transfer destination but has no flash callback.
+    client.whitelist_flash_loan_receiver(&admin, &asset);
+    let before = tok_client(&env, &asset).balance(&client.address);
+    assert_eq!(
+        client.try_flash_loan(&depositor, &asset, &asset, &10_000),
+        Err(Ok(Error::FlashLoanCallbackFailed))
+    );
+    assert_eq!(tok_client(&env, &asset).balance(&client.address), before);
+    assert_eq!(tok_client(&env, &asset).balance(&asset), 0);
+}
+
+#[test]
+fn test_error_diagnostics_insurance_transfer_failure_rolls_back_accounting() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, admin) = setup(&env);
+    env.as_contract(&client.address, || {
+        env.storage().instance().set(
+            &DataKey::InsuranceFund,
+            &InsuranceFund {
+                total_premiums_collected: 1000,
+                total_claims_paid: 0,
+                available_balance: 1000,
+            },
+        );
+    });
+    let before = client.get_insurance_fund_state();
+    assert_eq!(
+        client.try_withdraw_from_insurance_fund(&admin, &1000),
+        Err(Ok(Error::TransferFailed))
+    );
+    assert_eq!(client.get_insurance_fund_state(), before);
+}
+
+// ─── Dutch Auction Liquidation Tests (#1149) ───────────────────────
+
+#[test]
+fn test_dutch_auction_linear_price_reduction() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, collateral_addr, _admin) = setup(&env);
+
+    let depositor = Address::generate(&env);
+    let borrower = Address::generate(&env);
+    mint_to(&env, &token_addr, &depositor, 50_000);
+    mint_to(&env, &collateral_addr, &borrower, 50_000);
+
+    client.deposit(&depositor, &token_addr, &20_000u64);
+
+    let loan_id = client.borrow(
+        &borrower,
+        &token_addr,
+        &5_000u64,
+        &collateral_addr,
+        &7_500u64,
+        &(24 * 60 * 60),
+    );
+
+    // Fast-forward past grace period (due_date + 3 days grace floor = 4 days, so jump 5 days)
+    let start_time = env.ledger().timestamp() + 5 * 24 * 60 * 60;
+    env.ledger().set_timestamp(start_time);
+
+    // Start auction
+    client.start_liquidation_auction(&loan_id);
+
+    // At t = 0: price = 10,000 bps
+    assert_eq!(client.get_auction_price(&loan_id), 10_000);
+
+    // At t = 6 hours (25% elapsed): price drops by 25% of (10000 - 6000) = 1000 -> 9000
+    env.ledger().set_timestamp(start_time + 6 * 3600);
+    assert_eq!(client.get_auction_price(&loan_id), 9_000);
+
+    // At t = 12 hours (50% elapsed): price drops by 50% of 4000 = 2000 -> 8000
+    env.ledger().set_timestamp(start_time + 12 * 3600);
+    assert_eq!(client.get_auction_price(&loan_id), 8_000);
+
+    // At t = 18 hours (75% elapsed): price drops by 75% of 4000 = 3000 -> 7000
+    env.ledger().set_timestamp(start_time + 18 * 3600);
+    assert_eq!(client.get_auction_price(&loan_id), 7_000);
+
+    // At t = 24 hours (100% elapsed): price hits floor 6000 bps
+    env.ledger().set_timestamp(start_time + 24 * 3600);
+    assert_eq!(client.get_auction_price(&loan_id), 6_000);
+
+    // Beyond 24 hours: stays at floor 6000 bps
+    env.ledger().set_timestamp(start_time + 30 * 3600);
+    assert_eq!(client.get_auction_price(&loan_id), 6_000);
+}
+
+#[test]
+fn test_dutch_auction_liquidation_purchase_and_settlement() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, collateral_addr, _admin) = setup(&env);
+
+    let depositor = Address::generate(&env);
+    let borrower = Address::generate(&env);
+    let liquidator = Address::generate(&env);
+
+    mint_to(&env, &token_addr, &depositor, 50_000);
+    mint_to(&env, &collateral_addr, &borrower, 50_000);
+    mint_to(&env, &token_addr, &liquidator, 50_000);
+
+    client.deposit(&depositor, &token_addr, &20_000u64);
+
+    let loan_id = client.borrow(
+        &borrower,
+        &token_addr,
+        &4_000u64,
+        &collateral_addr,
+        &8_000u64,
+        &(24 * 60 * 60),
+    );
+
+    // Advance past grace period
+    let start_time = env.ledger().timestamp() + 5 * 24 * 60 * 60;
+    env.ledger().set_timestamp(start_time);
+
+    // Start auction
+    client.start_liquidation_auction(&loan_id);
+    let auction = client.get_liquidation_auction(&loan_id).unwrap();
+    assert_eq!(auction.loan_id, loan_id);
+    assert_eq!(auction.debt_amount, 4_000);
+    assert_eq!(auction.is_completed, false);
+
+    // Liquidator buys at 12 hours (price = 8000 bps)
+    env.ledger().set_timestamp(start_time + 12 * 3600);
+
+    // Liquidator repays full 4000 debt
+    // At 8000 bps price: collateral seized = 4000 * 10000 / 8000 = 5000
+    // Remaining collateral refunded to borrower = 8000 - 5000 = 3000
+    let liquidator_collateral_before = tok_client(&env, &collateral_addr).balance(&liquidator);
+    let borrower_collateral_before = tok_client(&env, &collateral_addr).balance(&borrower);
+
+    let seized = client.buy_liquidation_auction(&liquidator, &loan_id, &4_000u64);
+    assert_eq!(seized, 5_000);
+
+    // Verify liquidator received 5000 collateral
+    assert_eq!(
+        tok_client(&env, &collateral_addr).balance(&liquidator),
+        liquidator_collateral_before + 5_000
+    );
+
+    // Verify borrower received refund of remaining 3000 collateral
+    assert_eq!(
+        tok_client(&env, &collateral_addr).balance(&borrower),
+        borrower_collateral_before + 3_000
+    );
+
+    // Loan should be closed and auction marked completed
+    assert!(client.get_loan(&borrower).is_none());
+    assert!(client.get_loan_by_id(&loan_id).is_none());
+    let auction_after = client.get_liquidation_auction(&loan_id).unwrap();
+    assert_eq!(auction_after.is_completed, true);
+}
+
+#[test]
+fn test_liquidate_loan_auto_starts_auction() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, collateral_addr, _admin) = setup(&env);
+
+    let depositor = Address::generate(&env);
+    let borrower = Address::generate(&env);
+    let liquidator = Address::generate(&env);
+
+    mint_to(&env, &token_addr, &depositor, 50_000);
+    mint_to(&env, &collateral_addr, &borrower, 50_000);
+    mint_to(&env, &token_addr, &liquidator, 50_000);
+
+    client.deposit(&depositor, &token_addr, &20_000u64);
+
+    let loan_id = client.borrow(
+        &borrower,
+        &token_addr,
+        &2_000u64,
+        &collateral_addr,
+        &4_000u64,
+        &(24 * 60 * 60),
+    );
+
+    // Advance past grace period
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 5 * 24 * 60 * 60);
+
+    // Call liquidate_loan directly without prior start_liquidation_auction call
+    let seized = client.liquidate_loan(&liquidator, &loan_id, &2_000u64);
+    // At t = 0 of auto-started auction, price = 10000 bps -> seized = 2000 * 10000 / 10000 = 2000
+    assert_eq!(seized, 2_000);
+
+    // Loan is settled, remaining 2000 collateral refunded to borrower
+    assert!(client.get_loan_by_id(&loan_id).is_none());
+}
+
+#[test]
+fn test_verify_proof_of_reserves() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, collateral_addr, _admin) = setup(&env);
+
+    let depositor = Address::generate(&env);
+    let borrower = Address::generate(&env);
+    mint_to(&env, &token_addr, &depositor, 10_000);
+    mint_to(&env, &collateral_addr, &borrower, 10_000);
+
+    // Initial reserves check: 0 liabilities, 0 actual balance, fully backed = true
+    let (liabilities, actual, backed) = client.verify_proof_of_reserves(&token_addr);
+    assert_eq!(liabilities, 0);
+    assert_eq!(actual, 0);
+    assert!(backed);
+
+    // After deposit of 5000:
+    client.deposit(&depositor, &token_addr, &5_000u64);
+    let (liabilities, actual, backed) = client.verify_proof_of_reserves(&token_addr);
+    assert_eq!(liabilities, 5_000);
+    assert_eq!(actual, 5_000);
+    assert!(backed);
 }

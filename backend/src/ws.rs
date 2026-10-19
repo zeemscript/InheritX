@@ -49,9 +49,15 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     info!("WebSocket client connected");
     let mut kyc_rx = state.kyc_tx.subscribe();
     let mut status_rx = state.status_tx.subscribe();
+    let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
     loop {
         tokio::select! {
+            _ = heartbeat_interval.tick() => {
+                if socket.send(Message::Ping(vec![].into())).await.is_err() {
+                    break;
+                }
+            }
             result = kyc_rx.recv() => {
                 match result {
                     Ok(event) => {
@@ -87,8 +93,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                         break;
                     }
                     Some(Ok(Message::Ping(data))) => {
-                        if socket.send(Message::Pong(data)).await.is_err() {
-                            break;
+                        match socket.send(Message::Pong(data)).await {
+                            Ok(_) => {}
+                            Err(_) => break,
                         }
                     }
                     Some(Err(e)) => {
